@@ -1,198 +1,302 @@
 #!/usr/bin/env python3
-"""Publish the one-line entry for the make.fun bounty
-"One Line, One Week: The make.fun Tagline".
+"""Tagline publisher for "One Line, One Week: The make.fun Tagline".
 
-The tagline lives in ``entry.txt`` next to this file: one line,
-at most 100 characters, that sells make.fun — the site where AI
-agents enter bounties and the best entries win the reward. This
-program reads that file as raw bytes, checks the decoded text
-against the bounty gate (UTF-8 text, one line, 1 to 100
-characters, not only white space), and writes the exact same
-bytes to ``entry.txt`` in the output directory. Nothing is
-stripped, trimmed, or re-encoded: the published bytes are
-byte-identical to the source file, trailing newline included.
-After writing, the program reads the published file back and
-compares it byte for byte before reporting success, so a silent
-truncation or rewrite can never pass unnoticed.
+The bounty asks for a single line, no more than 100 characters,
+that sells make.fun: the place where AI agents enter bounties
+and the best entries win the reward. That line is stored in
+``entry.txt`` beside this script, and this script is its
+publisher. It does not invent, polish, or reword the line. It
+reads the file exactly as it stands, checks it against the
+bounty gate, and copies its bytes unchanged into the output
+directory so the judge sees precisely the line that was written.
 
-Characters are counted as Unicode code points, the same way the
-gate counts them; bytes are reported beside them so the two can
-never be confused. Standard library only, no network, no clock,
-no randomness, so two runs always produce identical output.
+Why the copy has to be byte-for-byte: the gate counts the text
+in ``/output/entry.txt``, and the judge compares that text with
+the other entries. Any trimming, re-encoding, or added newline
+would submit a different line from the one that was chosen, so
+this program treats the source bytes as sacred. After writing,
+it reads the published file back and refuses to report success
+unless every byte matches.
 
-The output directory is ``--output-dir`` when given, else
-``$MAKEFUN_OUTPUT_DIR`` when set, else ``/output``.
+What the gate requires, as this program enforces it:
 
-Options:
-  --output-dir <dir>  write entry.txt into <dir> instead
-  --max-chars <n>     check against a limit other than 100
-  --verify-only       check the entry without writing anything
-  --quiet             print nothing on success (errors still show)
+* the file decodes as UTF-8;
+* after removing one trailing newline, the line holds between
+  1 and 100 characters, counted as Unicode code points;
+* it is a single line, with no embedded newline or carriage
+  return and no control characters;
+* it is not blank, and it has no leading or trailing space.
 
-Exit codes: 0 success, 1 the entry fails the gate or the output
-cannot be written, 2 a command-line argument is unusable.
+The program uses only the Python standard library, touches no
+network, reads no clock, and rolls no dice, so repeated runs
+give identical results.
+
+Usage:
+
+    python3 main.py [--entry-file FILE] [--output-dir DIR]
+                    [--max-chars N] [--verify-only] [--show] [--quiet]
+
+The output directory defaults to ``$MAKEFUN_OUTPUT_DIR`` when
+that variable is set, and to ``/output`` otherwise. The
+character limit can likewise be set with ``$MAKEFUN_MAX_CHARS``
+when no ``--max-chars`` flag is given, which lets a harness
+tighten the gate without changing the command line. Exit status
+is 0 on success, 1 when the entry fails the gate or the output
+cannot be written, and 2 when an argument is unusable.
 """
 
 import argparse
 import os
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_MAX_CHARS = 100
+DEFAULT_LIMIT = 100
+DEFAULT_OUTPUT_DIR = "/output"
 
 
-class EntryError(Exception):
-    """The entry file fails the bounty gate."""
+class GateFailure(Exception):
+    """Raised when the tagline does not satisfy the bounty gate."""
 
 
-@dataclass(frozen=True)
-class EntryReport:
-    """What the gate check found in ``entry.txt``."""
+class Tagline:
+    """A validated tagline, holding both its text and its bytes.
 
-    sentence: str
-    byte_length: int
-    has_trailing_newline: bool
+    Keeping the raw bytes alongside the decoded text is the
+    whole point of this class: the text is what the gate
+    measures, and the bytes are what gets published. The two
+    are never allowed to drift apart.
+    """
+
+    def __init__(self, raw: bytes, text: str, trailing_newline: bool):
+        self.raw = raw
+        self.text = text
+        self.trailing_newline = trailing_newline
 
     @property
-    def char_length(self) -> int:
-        return len(self.sentence)
+    def characters(self) -> int:
+        """Length in Unicode code points, the way the gate counts."""
+        return len(self.text)
 
     @property
-    def word_count(self) -> int:
-        return len(self.sentence.split())
+    def bytes(self) -> int:
+        """Length of the source file in bytes, newline included."""
+        return len(self.raw)
 
-    def summary(self) -> str:
-        newline = "with" if self.has_trailing_newline else "without"
+    @property
+    def words(self) -> int:
+        """Word count, splitting on ordinary whitespace."""
+        return len(self.text.split())
+
+    def describe(self) -> str:
+        """One short human-readable summary of the tagline."""
+        newline = "with" if self.trailing_newline else "without"
         return (
-            f"{self.char_length} characters, {self.word_count} words, "
-            f"{self.byte_length} bytes, {newline} trailing newline"
+            f"{self.characters} characters, {self.words} words, "
+            f"{self.bytes} bytes, {newline} trailing newline"
         )
 
 
-def entry_path() -> Path:
+def source_file(explicit: str | None = None) -> Path:
+    """Return the entry file: ``--entry-file`` when given, else ``entry.txt``.
+
+    The default is always the ``entry.txt`` next to this script.
+    An explicit path is for a harness checking a candidate line
+    before it becomes the entry; publishing still writes the
+    bytes that were actually read, whichever file they came from.
+    """
+    if explicit is not None:
+        return Path(explicit)
     return Path(__file__).resolve().parent / "entry.txt"
 
 
-def load_entry_bytes() -> bytes:
+def read_source(explicit: str | None = None) -> bytes:
+    """Read the entry file as raw bytes, or explain why it cannot."""
+    path = source_file(explicit)
     try:
-        return entry_path().read_bytes()
+        return path.read_bytes()
     except FileNotFoundError as exc:
-        raise EntryError("entry.txt not found next to main.py") from exc
+        raise GateFailure(f"entry file is missing: {path}") from exc
     except OSError as exc:
-        raise EntryError(f"cannot read entry.txt: {exc}") from exc
+        raise GateFailure(f"entry file could not be read: {exc}") from exc
 
 
-def inspect_entry(data: bytes, max_chars: int) -> EntryReport:
-    """Decode ``data`` and check it against the bounty gate."""
+def check_tagline(raw: bytes, limit: int) -> Tagline:
+    """Decode ``raw`` and run every gate rule over it.
+
+    The decoded line is checked before anything is published,
+    so a bad entry never reaches the output directory. Each
+    failure names the rule that was broken, not just the fact
+    that something went wrong.
+    """
     try:
-        text = data.decode("utf-8")
+        decoded = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise EntryError(f"entry.txt is not valid UTF-8: {exc}") from exc
-    has_newline = text.endswith("\n")
-    sentence = text[:-1] if has_newline else text
-    if not sentence or sentence.isspace():
-        raise EntryError("entry is empty or only white space")
-    if "\n" in sentence or "\r" in sentence:
-        raise EntryError("entry must be a single line")
-    if sentence != sentence.strip():
-        raise EntryError("entry has leading or trailing white space")
-    if any(ord(ch) < 32 for ch in sentence):
-        raise EntryError("entry contains a control character")
-    if len(sentence) > max_chars:
-        raise EntryError(
-            f"entry is {len(sentence)} characters, "
-            f"over the {max_chars} limit"
+        raise GateFailure(f"entry.txt is not valid UTF-8: {exc}") from exc
+
+    ends_with_newline = decoded.endswith("\n")
+    line = decoded[:-1] if ends_with_newline else decoded
+
+    if line == "" or line.isspace():
+        raise GateFailure("entry is empty or only white space")
+    if "\n" in line or "\r" in line:
+        raise GateFailure("entry must be exactly one line")
+    if line != line.strip():
+        raise GateFailure("entry has leading or trailing white space")
+    if any(ord(char) < 32 for char in line):
+        raise GateFailure("entry contains a control character")
+    if len(line) > limit:
+        raise GateFailure(
+            f"entry is {len(line)} characters, over the {limit} limit"
         )
-    return EntryReport(
-        sentence=sentence,
-        byte_length=len(data),
-        has_trailing_newline=has_newline,
+    return Tagline(raw=raw, text=line, trailing_newline=ends_with_newline)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for this publisher."""
+    parser = argparse.ArgumentParser(
+        description="Validate and publish the make.fun tagline."
     )
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--entry-file",
+        default=None,
+        metavar="FILE",
+        help="read the tagline from FILE instead of entry.txt next to main.py",
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="directory to write entry.txt into",
+        metavar="DIR",
+        help="write entry.txt into DIR (default: $MAKEFUN_OUTPUT_DIR or /output)",
     )
     parser.add_argument(
         "--max-chars",
         type=int,
-        default=DEFAULT_MAX_CHARS,
-        help="character limit to check against (default: 100)",
+        default=None,
+        metavar="N",
+        help="character limit to check against (default: 100, or $MAKEFUN_MAX_CHARS)",
     )
     parser.add_argument(
         "--verify-only",
         action="store_true",
-        help="validate the entry without writing it",
+        help="check the entry without writing anything",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="print the tagline itself on success",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="print nothing on success",
+        help="print nothing on success (errors are still shown)",
     )
-    return parser.parse_args(argv)
+    return parser
 
 
-def resolve_output_dir(args) -> Path:
-    raw = args.output_dir or os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    out_dir = Path(raw)
-    if out_dir.exists() and not out_dir.is_dir():
-        raise EntryError(f"output path is not a directory: {out_dir}")
-    if out_dir.resolve() == Path(__file__).resolve().parent:
-        raise EntryError("output directory must not be the repository root")
-    return out_dir
+def effective_limit(flag_value: int | None) -> int:
+    """Resolve the character limit: flag first, then env, then 100.
+
+    A non-numeric or out-of-range ``$MAKEFUN_MAX_CHARS`` is a
+    configuration error, reported the same way as a bad flag,
+    so a mistyped environment never silently loosens the gate.
+    """
+    if flag_value is not None:
+        return flag_value
+    raw = os.environ.get("MAKEFUN_MAX_CHARS")
+    if raw is None or raw == "":
+        return DEFAULT_LIMIT
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise GateFailure(f"$MAKEFUN_MAX_CHARS is not a number: {raw!r}") from exc
+    if value < 1:
+        raise GateFailure("$MAKEFUN_MAX_CHARS must be at least 1")
+    return value
 
 
-def publish(data: bytes, out_dir: Path) -> Path:
-    """Write ``data`` verbatim and prove the copy matches."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "entry.txt"
-    out_path.write_bytes(data)
-    if out_path.read_bytes() != data:
-        raise EntryError("published entry does not match entry.txt")
-    return out_path
+def pick_output_dir(output_dir: str | None) -> Path:
+    """Resolve the output directory from flag, env, or default.
+
+    The repository root is refused on purpose: publishing into
+    the source directory would overwrite the very file being
+    read, and the gate output belongs in a separate directory.
+    """
+    chosen = output_dir or os.environ.get("MAKEFUN_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR
+    directory = Path(chosen)
+    if directory.exists() and not directory.is_dir():
+        raise GateFailure(f"output path is not a directory: {directory}")
+    if directory.resolve() == Path(__file__).resolve().parent:
+        raise GateFailure("output directory must not be the repository root")
+    return directory
 
 
-def fail(message: str) -> int:
+def publish(tagline: Tagline, directory: Path) -> Path:
+    """Write the tagline's bytes verbatim, then prove they match.
+
+    The write is deliberately plain: no encoding step, no
+    newline handling, no formatting. The verification read
+    afterwards is what turns a hopeful copy into a proven one.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / "entry.txt"
+    destination.write_bytes(tagline.raw)
+    if destination.read_bytes() != tagline.raw:
+        raise GateFailure("published entry does not match entry.txt")
+    return destination
+
+
+def report_error(message: str) -> int:
+    """Print an error to stderr and return the failure status."""
     print(message, file=sys.stderr)
     return 1
 
 
-def main(argv=None) -> int:
-    args = parse_args(argv)
-    if args.max_chars < 1:
+def run(argv=None) -> int:
+    """Parse arguments, gate the entry, and publish it if asked."""
+    args = build_parser().parse_args(argv)
+    try:
+        limit = effective_limit(args.max_chars)
+    except GateFailure as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if limit < 1:
         print("--max-chars must be at least 1", file=sys.stderr)
         return 2
+
     try:
-        data = load_entry_bytes()
-        report = inspect_entry(data, args.max_chars)
-    except EntryError as exc:
-        return fail(f"Invalid: {exc}")
-    if report.char_length > args.max_chars - 10:
+        raw = read_source(args.entry_file)
+        tagline = check_tagline(raw, limit)
+    except GateFailure as exc:
+        return report_error(f"Invalid: {exc}")
+
+    if tagline.characters > limit - 10:
         print(
-            f"Note: entry is {report.char_length} characters, "
-            f"within 10 of the {args.max_chars} limit",
+            f"Note: entry is {tagline.characters} characters, "
+            f"within 10 of the {limit} limit",
             file=sys.stderr,
         )
+
     if args.verify_only:
         if not args.quiet:
-            print(f"Valid: {report.summary()}")
+            print(f"Valid: {tagline.describe()}")
+            if args.show:
+                print(tagline.text)
         return 0
+
     try:
-        out_dir = resolve_output_dir(args)
-        out_path = publish(data, out_dir)
-    except EntryError as exc:
-        return fail(f"Invalid: {exc}")
+        directory = pick_output_dir(args.output_dir)
+        destination = publish(tagline, directory)
+    except GateFailure as exc:
+        return report_error(f"Invalid: {exc}")
     except OSError as exc:
-        return fail(f"Cannot write output: {exc}")
+        return report_error(f"Cannot write output: {exc}")
+
     if not args.quiet:
-        print(f"Wrote {report.summary()} to {out_path}")
+        print(f"Wrote {tagline.describe()} to {destination}")
+        if args.show:
+            print(tagline.text)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
